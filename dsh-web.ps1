@@ -11,7 +11,7 @@ param(
     [ValidateSet('start', 'stop', 'restart', 'status', 'watchdog')]
     [string]$Command = 'status',
     [string]$Node = '',                 # 空则自动探测 node.exe
-    [string]$WorkDir = 'G:\AI\harness', # dsh 仓库根目录(按本机修改)
+    [string]$WorkDir = '',                 # 空则自动探测: 环境变量 DSH_WORKDIR → 脚本目录向上查找
     [int]$Port = 3080
 )
 
@@ -24,7 +24,15 @@ if (-not $Node) {
               'C:\Program Files\nodejs\node.exe')
     $Node = $cand | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 }
-if (-not $Node) { throw '找不到 node.exe,请用 -Node 指定' }
+# WorkDir 探测顺序: -WorkDir 参数 → 环境变量 DSH_WORKDIR → 脚本所在目录向上查找 dsh 仓库根(特征文件 apps\cli\src\bin.ts)
+if (-not $WorkDir) { $WorkDir = $env:DSH_WORKDIR }
+if (-not $WorkDir) {
+    $dir = $PSScriptRoot
+    while ($dir) {
+        if (Test-Path (Join-Path $dir 'apps\cli\src\bin.ts')) { $WorkDir = $dir; break }
+        $dir = Split-Path $dir -Parent
+    }
+}
 
 $OutLog  = Join-Path $DshHome 'dsh-web.out.log'
 $ErrLog  = Join-Path $DshHome 'dsh-web.err.log'
@@ -45,6 +53,8 @@ function Start-Web {
         Write-Host "dsh web already running (PID $old on port $Port)"
         return
     }
+    if (-not $Node) { throw '找不到 node.exe,请用 -Node 指定或加入 PATH' }
+    if (-not $WorkDir) { throw '找不到 dsh 仓库根目录(apps\cli\src\bin.ts),请设置环境变量 DSH_WORKDIR 或用 -WorkDir 指定' }
     $p = Start-Process -FilePath $Node `
         -ArgumentList '--import', 'tsx/esm', 'apps/cli/src/bin.ts', 'web' `
         -WorkingDirectory $WorkDir -WindowStyle Hidden `

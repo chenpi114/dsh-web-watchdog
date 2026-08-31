@@ -58,9 +58,25 @@ powershell -File "$env:USERPROFILE\.dsh\dsh-web.ps1" -Command stop
 | 参数 | 默认值 | 说明 |
 |---|---|---|
 | `-Node` | 自动探测 | node.exe 路径 |
-| `-WorkDir` | `G:\AI\harness` | dsh 仓库根目录（按本机修改） |
+| `-WorkDir` | 自动探测 | dsh 仓库根目录（探测顺序见下） |
 | `-Port` | `3080` | 服务端口 |
 | `-DshHome` | 脚本所在目录 | 日志/标记/看门狗所在目录 |
+
+## WorkDir 自动探测
+
+`-WorkDir` 不传时，按以下顺序探测 dsh 仓库根目录（特征文件 `apps\cli\src\bin.ts`）：
+
+1. 环境变量 `DSH_WORKDIR`；
+2. 从脚本所在目录向上逐级查找（脚本放在 dsh 仓库内时自动命中）；
+3. 都没有时 `start` 会报错提示（`status` / `stop` 不受影响）。
+
+脚本通过 `install.ps1` 部署到 `%USERPROFILE%\.dsh` 后（与 dsh 仓库分离），建议设置环境变量：
+
+```powershell
+setx DSH_WORKDIR "D:\path\to\deepseek-harness"
+```
+
+设置后需重新打开终端（或重启看门狗进程）生效；也可以每次调用时传 `-WorkDir`。
 
 ## FAQ
 
