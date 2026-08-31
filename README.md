@@ -211,6 +211,23 @@ pnpm run build:web
 
 2. **浏览器标签页开着时**：前端自带自动重连（指数退避），服务恢复后页面自动续上原对话，不需要通知也能继续。
 
+## 补丁文件
+
+`patches/dsh-harness-auto-resume.patch` 包含全部 DeepSeek Harness 本地补丁（未提交上游）：
+
+| 文件 | 内容 |
+|---|---|
+| `apps/web/vite.config.ts` | 修复 vite 5.4 的 `assetFileNames` 在 CSS `url()` 引用场景崩溃（`names` 为 undefined） |
+| `packages/bundle/web-app/src/index.ts` | 服务端零点击自动恢复：启动时检测最新会话的打断轮次，自动发送"继续" |
+
+应用方式（在 dsh 仓库根目录）：
+
+```powershell
+git apply patches/dsh-harness-auto-resume.patch
+```
+
+服务端补丁通过 tsx 源码运行，**下次服务重启即生效**，无需重新构建；vite 修复在下次 `pnpm run build:web` 时生效。
+
 ## FAQ
 
 **Q：为什么不用"每 N 分钟的计划任务"来检查？**

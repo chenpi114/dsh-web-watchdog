@@ -26,7 +26,7 @@ $time = Get-Date -Format 'HH:mm:ss'
 $n = New-Object System.Windows.Forms.NotifyIcon
 try {
     if (-not $IconPath) {
-        $IconPath = @((Join-Path $PSScriptRoot 'deepseek-harness.ico'), 'G:\AI\harness\assets\deepseek-harness.ico') |
+        $IconPath = @((Join-Path $PSScriptRoot 'deepseek-harness.ico')) |
             Where-Object { Test-Path $_ } | Select-Object -First 1
     }
     if ($IconPath -and (Test-Path $IconPath)) {

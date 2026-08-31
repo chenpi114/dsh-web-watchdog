@@ -1,0 +1,134 @@
+diff --git a/apps/web/vite.config.ts b/apps/web/vite.config.ts
+index 7b9ef7a..b71086b 100644
+--- a/apps/web/vite.config.ts
++++ b/apps/web/vite.config.ts
+@@ -111,7 +111,9 @@ export default defineConfig({
+           return isLangChunk ? 'assets/langs/[name]-[hash].js' : 'assets/[name]-[hash].js'
+         },
+         assetFileNames(asset): string {
+-          const fileName = asset.names[0] ?? ''
++          // vite 5.4 的 css-post 路径调用本钩子时传入的对象只有 `name`
++          // 没有 `names`(数组), 容错读取, 否则 CSS 含 url() 引用时构建崩溃。
++          const fileName = (asset.names?.[0] ?? asset.name) || ''
+           const isFont = FONT_EXTENSIONS.some(ext => fileName.endsWith(ext))
+           return isFont ? 'assets/fonts/[name]-[hash][extname]' : 'assets/[name]-[hash][extname]'
+         },
+diff --git a/packages/bundle/web-app/src/index.ts b/packages/bundle/web-app/src/index.ts
+index 9b5207d..c3ba2f5 100644
+--- a/packages/bundle/web-app/src/index.ts
++++ b/packages/bundle/web-app/src/index.ts
+@@ -66,6 +66,91 @@ export interface WebRuntimeValues {
+ /** Environment variable naming the canonical local URL of this Web GUI. */
+ const DSH_WEB_URL = 'DSH_WEB_URL' as const
+ 
++// ---- 自动恢复被打断的轮次 (本地功能, 未提交上游) ----
++// 服务启动后: 检查最新非空白会话的持久化日志尾部是否有未闭合的轮次
++// (进程被杀/崩溃留下的 torn tail), 有则通过 apiProxy 发送"继续",
++// 让 agent 自动接着干活。不依赖浏览器页面。判断基于日志尾部:
++// 正常完成的会话不会误触发; 继续后新轮次闭合, 下次启动不再触发。
++interface AutoResumeSessionRow {
++  sessionId: string
++  blank: boolean
++  updatedAt: number
++}
++interface AutoResumeApi {
++  sessions: {
++    list(request: { rpcId: string; payload: unknown }): Promise<{
++      rpcId: string
++      result: { ok: boolean; value?: { items?: AutoResumeSessionRow[] }; error?: { code?: string } }
++    }>
++    prompt(request: {
++      rpcId: string
++      payload: { sessionId: string; mode: 'queue' | 'steer'; content: unknown[] }
++    }): Promise<{
++      rpcId: string
++      result: { ok: boolean; error?: { code?: string } }
++    }>
++  }
++}
++interface AutoResumePersistence {
++  list(): Promise<Array<{ id: string }>>
++  inspect(id: string): Promise<{ events: Array<{ type: string; data?: { reason?: { kind?: string } } }> }>
++}
++
++/**
++ * 判断会话日志尾部是否为"被打断"的轮次。inspect 返回的事件已应用
++ * 修复器的合成闭合(崩溃轮次被补上 turn/end, reason=interrupted),
++ * 因此: 1) 尾部有未闭合轮次, 或 2) 最后一个 turn/end 以 interrupted
++ * 闭合, 都视为需要自动继续。
++ */
++function tornTail(events: readonly { type: string; data?: { reason?: { kind?: string } } }[]): boolean {
++  let open = false
++  let lastEndReason: string | undefined
++  for (const event of events) {
++    if (event.type === 'turn/start') open = true
++    else if (event.type === 'turn/end') {
++      open = false
++      lastEndReason = event.data?.reason?.kind ?? 'completed'
++    }
++  }
++  if (open) return true
++  return lastEndReason === 'interrupted'
++}
++
++/**
++ * One-shot auto-resume after a restart: the latest non-blank session with a
++ * torn tail receives a "继续" prompt through the same RPC the GUI uses.
++ * @param ctx - plugin context with the apiProxy and sessionPersistence services.
++ */
++async function autoResumeAfterRestart(ctx: Context): Promise<void> {
++  try {
++    const api = ctx.get('apiProxy') as AutoResumeApi | undefined
++    const persistence = ctx.get('sessionPersistence') as AutoResumePersistence | undefined
++    if (api === undefined || persistence === undefined) return
++    const listed = await api.sessions.list({ rpcId: crypto.randomUUID(), payload: {} })
++    const listResult = listed.result
++    const items = (listResult.ok ? listResult.value?.items : undefined) ?? []
++    const target = items
++      .filter(item => !item.blank)
++      .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]
++    if (target === undefined) return
++    const inspected = await persistence.inspect(target.sessionId)
++    if (!tornTail(inspected.events)) return
++    const prompt = await api.sessions.prompt({
++      rpcId: crypto.randomUUID(),
++      payload: {
++        sessionId: target.sessionId,
++        mode: 'queue',
++        content: [{ type: 'text', text: '继续' }],
++      },
++    })
++    const promptResult = prompt.result
++    console.log(`[auto-resume] session ${target.sessionId} interrupted; sent 继续 (${promptResult.ok ? 'accepted' : String(promptResult.error?.code ?? 'error')})`)
++  } catch (error: unknown) {
++    // 自动恢复是尽力而为: 任何失败都只记录, 不影响启动。
++    console.warn(`[auto-resume] skipped: ${error instanceof Error ? error.message : String(error)}`)
++  }
++}
++
+ // Display-only mirror of the webserver schema's loopback host: the address the
+ // local URL always prints. Not a source of truth — the schema is.
+ const LOOPBACK_HOST = '127.0.0.1'
+@@ -171,13 +256,20 @@ export function apply(ctx: Context, config: Config): void {
+     // readiness by waiting for its Loader tree, or prints at once in a
+     // hand-built context without Loader.
+     const settled = ctx.get('loader')?.await()
+-    if (settled === undefined) printUrl()
++    if (settled === undefined) {
++      printUrl()
++      void autoResumeAfterRestart(ctx)
++    }
+     else {
+       void settled.then(() => {
+         // The tree can be disposed while the boot was in flight (early
+         // SIGTERM); a URL line for a dead server would only mislead, and
+         // reading the torn-down port would turn a clean shutdown into a crash.
+-        if (ctx.get('webServer') !== undefined) printUrl()
++        if (ctx.get('webServer') !== undefined) {
++          printUrl()
++          // 服务就绪后执行一次自动恢复检查。
++          void autoResumeAfterRestart(ctx)
++        }
+       // Loader reports a failed boot; this row only stays quiet.
+       }, () => {})
+     }
