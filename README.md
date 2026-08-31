@@ -91,37 +91,68 @@ setx DSH_WORKDIR "D:\path\to\deepseek-harness"
 - **点击通知**会打开 GUI，并自动回到最新会话（深链 `?session=<会话ID>`）；
 - 通知进程独立运行（不阻塞看门狗），30 秒无操作自动消失。
 
-两部分前提：
+**自动"继续"**：如果被打断的对话轮次（崩溃时轮次未完成，host 恢复时会用合成事件闭合，特征为 `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED` 错误码的工具结果），点击通知打开会话后**自动发送"继续"**，agent 直接接着干活，不用再手动输入。
 
-1. **深链支持（GUI 侧）**：DeepSeek Harness 前端需要支持 `?session=<id>` 参数。默认版本尚未内置，需要在本机 dsh 仓库打一个很小的本地补丁（约 15 行，未提交上游）：
+前提：**深链支持（GUI 侧）**——DeepSeek Harness 前端需要支持 `?session=<id>` 参数。默认版本尚未内置，需要在本机 dsh 仓库打一个很小的本地补丁（约 40 行，未提交上游），核心逻辑在 `packages/client/web/src/app-shell.ts` 的 `apply()` 中（`ctx.slots.install(createSlotRenderer())` 之后）：
 
-   ```diff
-   --- a/packages/client/web/src/app-shell.ts
-   +++ b/packages/client/web/src/app-shell.ts
-   @@ apply(ctx) 中, ctx.slots.install(createSlotRenderer()) 之后:
-   +  // Deep link: `?session=<id>` 在会话列表就绪后自动打开(仅当尚无当前会话)
-   +  const wanted = new URLSearchParams(globalThis.location.search).get('session')
-   +  if (wanted !== null) {
-   +    ctx.effect(() => {
-   +      const id = wanted as SessionId
-   +      const openWhenReady = (): void => {
-   +        const state = ctx.sessions.list.getSnapshot()
-   +        if (state.current === undefined && state.byId[id] !== undefined) {
-   +          ctx.sessions.open(id)
-   +          globalThis.history?.replaceState(null, '', globalThis.location.pathname + globalThis.location.hash)
-   +        }
-   +      }
-   +      openWhenReady()
-   +      return ctx.sessions.list.subscribe(openWhenReady)
-   +    }, 'web: session deep link')
-   +  }
-   ```
+```ts
+// 1) 深链: `?session=<id>` 在会话列表就绪且无当前会话时自动打开, 打开后清理 URL
+// 2) 自动继续: 会话打开后, 若日志含 TOOL_OUTCOME_UNKNOWN / TOOL_NOT_STARTED
+//    错误码的工具结果(被打断轮次的合成闭合特征)且 agent 空闲, 自动 prompt "继续"
+const wanted = new URLSearchParams(globalThis.location.search).get('session')
+if (wanted !== null) {
+  ctx.effect(() => {
+    const id = wanted as SessionId
+    let prompted = false
+    let unsubscribeSession: (() => void) | undefined
+    const openWhenReady = (): void => {
+      const state = ctx.sessions.list.getSnapshot()
+      if (state.current === undefined && state.byId[id] !== undefined) {
+        ctx.sessions.open(id)
+        globalThis.history?.replaceState(null, '', globalThis.location.pathname + globalThis.location.hash)
+      }
+    }
+    const continueIfInterrupted = (): void => {
+      if (prompted) return
+      const binding = ctx.sessions.binding(id)
+      if (binding === undefined) return
+      const snapshot = binding.session.getSnapshot()
+      if (snapshot.openState !== 'open' || snapshot.running) return
+      const interrupted = snapshot.nodes.some((node) =>
+        node.kind === 'tool-result' && node.isError
+        && (node.error?.code === 'TOOL_OUTCOME_UNKNOWN' || node.error?.code === 'TOOL_NOT_STARTED'))
+      if (!interrupted) return
+      prompted = true
+      void binding.session.prompt([{ type: 'text', text: '继续' }], 'queue')
+    }
+    const attachSession = (): void => {
+      if (unsubscribeSession !== undefined) return
+      const binding = ctx.sessions.binding(id)
+      if (binding === undefined) return
+      unsubscribeSession = binding.session.subscribe(continueIfInterrupted)
+      continueIfInterrupted()
+    }
+    openWhenReady()
+    attachSession()
+    const unsubscribeList = ctx.sessions.list.subscribe(() => {
+      openWhenReady()
+      attachSession()
+    })
+    return () => {
+      unsubscribeList()
+      unsubscribeSession?.()
+    }
+  }, 'web: session deep link')
+}
+```
 
-   然后重建前端（静态文件，**无需重启服务**，刷新页面即生效）：
+（还需在文件顶部加 `import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'`。）
 
-   ```powershell
-   cd <dsh 仓库根目录>
-   pnpm run build:web
+然后重建前端（静态文件，**无需重启服务**，刷新页面即生效）：
+
+```powershell
+cd <dsh 仓库根目录>
+pnpm run build:web
    ```
 
 2. **浏览器标签页开着时**：前端自带自动重连（指数退避），服务恢复后页面自动续上原对话，不需要通知也能继续。
