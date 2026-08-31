@@ -118,7 +118,14 @@ if (wanted !== null) {
       if (binding === undefined) return
       const snapshot = binding.session.getSnapshot()
       if (snapshot.openState !== 'open' || snapshot.running) return
-      const interrupted = snapshot.nodes.some((node) =>
+      // 只检查最后一个用户消息之后的节点(最近一轮): 被打断轮次的合成闭合
+      // 特征出现在最近一轮才自动"继续"; 旧轮次的残留标记不会反复触发
+      let lastUserIndex = -1
+      for (let i = 0; i < snapshot.nodes.length; i++) {
+        if (snapshot.nodes[i].kind === 'user') lastUserIndex = i
+      }
+      const tail = lastUserIndex === -1 ? snapshot.nodes : snapshot.nodes.slice(lastUserIndex)
+      const interrupted = tail.some((node) =>
         node.kind === 'tool-result' && node.isError
         && (node.error?.code === 'TOOL_OUTCOME_UNKNOWN' || node.error?.code === 'TOOL_NOT_STARTED'))
       if (!interrupted) return
