@@ -90,16 +90,42 @@ setx DSH_WORKDIR "D:\path\to\deepseek-harness"
 - 标题：`DeepSeek Harness 已自动恢复`，含重启时间和新 PID；
 - **点击通知**会打开 GUI，并自动回到最新会话（深链 `?session=<会话ID>`）；
 - 通知进程独立运行（不阻塞看门狗），30 秒无操作自动消失；
-- **通知不是必需的**：即使不点通知，只要浏览器页面（重连）或重新打开页面，恢复逻辑同样生效。
+- **通知不是必需的**：即使不点通知，自动恢复同样生效。
 
-**零点击自动恢复（GUI 侧补丁）**：
+**服务端零点击自动恢复（推荐，已实测）**：在 `packages/bundle/web-app/src/index.ts` 打一个本地补丁（约 60 行，未提交上游）。**服务启动后**（不依赖浏览器页面）：
 
-1. 页面加载后若没有当前会话，自动打开**最近更新的非空白会话**（回到上次对话）；
-2. 检查当前会话**最后一轮**是否被打断（host 修复崩溃轮次时会生成合成闭合事件，特征为 `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED` 错误码的工具结果）；
-3. 被打断 → 自动发送"继续"，agent 直接接着干活；没被打断 → 不做任何事；
-4. `?session=<id>` 深链参数优先指定目标会话；每页只触发一次，agent 运行中不触发，旧轮次残留标记不会反复触发。
+1. 通过 `apiProxy.sessions.list` 取会话列表，选择**最新非空白会话**；
+2. 用 `sessionPersistence.inspect` 读该会话的持久化日志（已应用修复器的合成闭合，崩溃轮次的 `turn/end` 带 `reason: interrupted`）；
+3. 检测到"尾部轮次被打断" → 通过 `apiProxy.sessions.prompt` 自动发送"继续"；
+4. agent 自动醒来接着干活。正常完成的会话不误触发；继续后新轮次闭合，下次启动不再重复触发。
 
-前提：DeepSeek Harness 前端默认版本尚未内置此逻辑，需要在本机 dsh 仓库打一个本地补丁（约 70 行，未提交上游），核心逻辑在 `packages/client/web/src/app-shell.ts` 的 `apply()` 中（`ctx.slots.install(createSlotRenderer())` 之后）：
+核心逻辑（`autoResumeAfterRestart`，挂在 loader settled 之后）：
+
+```ts
+async function autoResumeAfterRestart(ctx: Context): Promise<void> {
+  const api = ctx.get('apiProxy') as AutoResumeApi | undefined
+  const persistence = ctx.get('sessionPersistence') as AutoResumePersistence | undefined
+  if (api === undefined || persistence === undefined) return
+  const listed = await api.sessions.list({ rpcId: crypto.randomUUID(), payload: {} })
+  const items = (listed.result.ok ? listed.result.value?.items : undefined) ?? []
+  const target = items.filter(i => !i.blank)
+    .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0))[0]
+  if (target === undefined) return
+  const inspected = await persistence.inspect(target.sessionId)
+  if (!tornTail(inspected.events)) return
+  await api.sessions.prompt({
+    rpcId: crypto.randomUUID(),
+    payload: {
+      sessionId: target.sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: '继续' }],
+    },
+  })
+}
+// tornTail: 尾部有未闭合轮次, 或最后一个 turn/end 的 reason === 'interrupted'
+```
+
+**前端补丁（补充）**：`packages/client/web/src/app-shell.ts` 的 `apply()` 中再加一个 `?session=<id>` 深链（页面打开时自动回到指定会话），核心逻辑（约 70 行，未提交上游）：
 
 ```ts
 // 零点击自动恢复: 深链参数优先; 无参数时自动打开最近的非空白会话;
