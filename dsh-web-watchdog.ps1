@@ -51,6 +51,17 @@ while ($true) {
         }
         Log "service restarted (PID $pid0)"
         $fail = 0
+        # 恢复通知(独立进程, 不阻塞看门狗): 托盘气泡, 点击打开 GUI 并深链回到最新会话
+        $notify = Join-Path $DshHome 'dsh-web-notify.ps1'
+        if (Test-Path $notify) {
+            try {
+                Start-Process -FilePath 'powershell.exe' `
+                    -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$notify`" -Port $Port -NewPid $pid0" `
+                    -WindowStyle Hidden | Out-Null
+            } catch {
+                Log "notify failed: $($_.Exception.Message)"
+            }
+        }
     }
     try {
         $proc = Get-Process -Id $pid0 -ErrorAction Stop

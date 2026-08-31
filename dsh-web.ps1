@@ -24,7 +24,7 @@ if (-not $Node) {
               'C:\Program Files\nodejs\node.exe')
     $Node = $cand | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
 }
-# WorkDir 探测顺序: -WorkDir 参数 → 环境变量 DSH_WORKDIR → 脚本所在目录向上查找 dsh 仓库根(特征文件 apps\cli\src\bin.ts)
+# WorkDir 探测顺序: -WorkDir 参数 → 环境变量 DSH_WORKDIR → 脚本所在目录向上查找 dsh 仓库根(特征文件 apps\cli\src\bin.ts) → 本机覆盖文件 dsh-web.env.ps1
 if (-not $WorkDir) { $WorkDir = $env:DSH_WORKDIR }
 if (-not $WorkDir) {
     $dir = $PSScriptRoot
@@ -32,6 +32,10 @@ if (-not $WorkDir) {
         if (Test-Path (Join-Path $dir 'apps\cli\src\bin.ts')) { $WorkDir = $dir; break }
         $dir = Split-Path $dir -Parent
     }
+}
+if (-not $WorkDir) {
+    $envFile = Join-Path $PSScriptRoot 'dsh-web.env.ps1'
+    if (Test-Path $envFile) { . $envFile }   # 本机覆盖(不入库): 文件里写 $WorkDir = '...'
 }
 
 $OutLog  = Join-Path $DshHome 'dsh-web.out.log'

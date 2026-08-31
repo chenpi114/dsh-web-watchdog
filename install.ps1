@@ -27,6 +27,7 @@ if ($Uninstall) {
 New-Item -ItemType Directory -Path $DshHome -Force | Out-Null
 Copy-Item (Join-Path $Here 'dsh-web.ps1') $DshHome -Force
 Copy-Item (Join-Path $Here 'dsh-web-watchdog.ps1') $DshHome -Force
+Copy-Item (Join-Path $Here 'dsh-web-notify.ps1') $DshHome -Force
 Write-Host "脚本已复制到 $DshHome"
 
 # 2) 计划任务:登录时启动常驻看门狗(ExecutionTimeLimit=PT0S 即不限时长)

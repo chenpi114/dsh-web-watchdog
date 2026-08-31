@@ -17,6 +17,7 @@
 |---|---|
 | `dsh-web.ps1` | 服务管理脚本：`start` / `stop` / `restart` / `status` / `watchdog` |
 | `dsh-web-watchdog.ps1` | 常驻看门狗（事件驱动，单实例互斥） |
+| `dsh-web-notify.ps1` | 自动恢复通知（托盘气泡，点击打开 GUI 并回到最新会话） |
 | `install.ps1` | 一键部署：复制脚本、注册计划任务、创建开机自启、立即启动 |
 
 ## 安装
@@ -68,15 +69,62 @@ powershell -File "$env:USERPROFILE\.dsh\dsh-web.ps1" -Command stop
 
 1. 环境变量 `DSH_WORKDIR`；
 2. 从脚本所在目录向上逐级查找（脚本放在 dsh 仓库内时自动命中）；
-3. 都没有时 `start` 会报错提示（`status` / `stop` 不受影响）。
+3. 脚本同目录下的本机覆盖文件 `dsh-web.env.ps1`（**不入库**，内容为 `$WorkDir = '你的 dsh 仓库路径'`）；
+4. 都没有时 `start` 会报错提示（`status` / `stop` 不受影响）。
 
-脚本通过 `install.ps1` 部署到 `%USERPROFILE%\.dsh` 后（与 dsh 仓库分离），建议设置环境变量：
+脚本通过 `install.ps1` 部署到 `%USERPROFILE%\.dsh` 后（与 dsh 仓库分离），推荐二选一：
 
 ```powershell
+# 方式 A: 环境变量(需要重新登录或重启终端生效)
 setx DSH_WORKDIR "D:\path\to\deepseek-harness"
+
+# 方式 B: 本机覆盖文件(立即生效, 不入库)
+# 在 %USERPROFILE%\.dsh\dsh-web.env.ps1 里写一行:
+#   $WorkDir = 'D:\path\to\deepseek-harness'
 ```
 
-设置后需重新打开终端（或重启看门狗进程）生效；也可以每次调用时传 `-WorkDir`。
+## 自动恢复通知与"继续之前的对话"
+
+看门狗自动拉起服务后，会弹出一个托盘通知：
+
+- 标题：`DeepSeek Harness 已自动恢复`，含重启时间和新 PID；
+- **点击通知**会打开 GUI，并自动回到最新会话（深链 `?session=<会话ID>`）；
+- 通知进程独立运行（不阻塞看门狗），30 秒无操作自动消失。
+
+两部分前提：
+
+1. **深链支持（GUI 侧）**：DeepSeek Harness 前端需要支持 `?session=<id>` 参数。默认版本尚未内置，需要在本机 dsh 仓库打一个很小的本地补丁（约 15 行，未提交上游）：
+
+   ```diff
+   --- a/packages/client/web/src/app-shell.ts
+   +++ b/packages/client/web/src/app-shell.ts
+   @@ apply(ctx) 中, ctx.slots.install(createSlotRenderer()) 之后:
+   +  // Deep link: `?session=<id>` 在会话列表就绪后自动打开(仅当尚无当前会话)
+   +  const wanted = new URLSearchParams(globalThis.location.search).get('session')
+   +  if (wanted !== null) {
+   +    ctx.effect(() => {
+   +      const id = wanted as SessionId
+   +      const openWhenReady = (): void => {
+   +        const state = ctx.sessions.list.getSnapshot()
+   +        if (state.current === undefined && state.byId[id] !== undefined) {
+   +          ctx.sessions.open(id)
+   +          globalThis.history?.replaceState(null, '', globalThis.location.pathname + globalThis.location.hash)
+   +        }
+   +      }
+   +      openWhenReady()
+   +      return ctx.sessions.list.subscribe(openWhenReady)
+   +    }, 'web: session deep link')
+   +  }
+   ```
+
+   然后重建前端（静态文件，**无需重启服务**，刷新页面即生效）：
+
+   ```powershell
+   cd <dsh 仓库根目录>
+   pnpm run build:web
+   ```
+
+2. **浏览器标签页开着时**：前端自带自动重连（指数退避），服务恢复后页面自动续上原对话，不需要通知也能继续。
 
 ## FAQ
 
