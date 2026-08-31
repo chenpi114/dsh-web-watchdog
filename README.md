@@ -83,74 +83,95 @@ setx DSH_WORKDIR "D:\path\to\deepseek-harness"
 #   $WorkDir = 'D:\path\to\deepseek-harness'
 ```
 
-## 自动恢复通知与"继续之前的对话"
+## 自动恢复通知与"继续之前的对话"（零点击）
 
 看门狗自动拉起服务后，会弹出一个托盘通知：
 
 - 标题：`DeepSeek Harness 已自动恢复`，含重启时间和新 PID；
 - **点击通知**会打开 GUI，并自动回到最新会话（深链 `?session=<会话ID>`）；
-- 通知进程独立运行（不阻塞看门狗），30 秒无操作自动消失。
+- 通知进程独立运行（不阻塞看门狗），30 秒无操作自动消失；
+- **通知不是必需的**：即使不点通知，只要浏览器页面（重连）或重新打开页面，恢复逻辑同样生效。
 
-**自动"继续"**：如果被打断的对话轮次（崩溃时轮次未完成，host 恢复时会用合成事件闭合，特征为 `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED` 错误码的工具结果），点击通知打开会话后**自动发送"继续"**，agent 直接接着干活，不用再手动输入。
+**零点击自动恢复（GUI 侧补丁）**：
 
-前提：**深链支持（GUI 侧）**——DeepSeek Harness 前端需要支持 `?session=<id>` 参数。默认版本尚未内置，需要在本机 dsh 仓库打一个很小的本地补丁（约 40 行，未提交上游），核心逻辑在 `packages/client/web/src/app-shell.ts` 的 `apply()` 中（`ctx.slots.install(createSlotRenderer())` 之后）：
+1. 页面加载后若没有当前会话，自动打开**最近更新的非空白会话**（回到上次对话）；
+2. 检查当前会话**最后一轮**是否被打断（host 修复崩溃轮次时会生成合成闭合事件，特征为 `TOOL_OUTCOME_UNKNOWN` / `TOOL_NOT_STARTED` 错误码的工具结果）；
+3. 被打断 → 自动发送"继续"，agent 直接接着干活；没被打断 → 不做任何事；
+4. `?session=<id>` 深链参数优先指定目标会话；每页只触发一次，agent 运行中不触发，旧轮次残留标记不会反复触发。
+
+前提：DeepSeek Harness 前端默认版本尚未内置此逻辑，需要在本机 dsh 仓库打一个本地补丁（约 70 行，未提交上游），核心逻辑在 `packages/client/web/src/app-shell.ts` 的 `apply()` 中（`ctx.slots.install(createSlotRenderer())` 之后）：
 
 ```ts
-// 1) 深链: `?session=<id>` 在会话列表就绪且无当前会话时自动打开, 打开后清理 URL
-// 2) 自动继续: 会话打开后, 若日志含 TOOL_OUTCOME_UNKNOWN / TOOL_NOT_STARTED
-//    错误码的工具结果(被打断轮次的合成闭合特征)且 agent 空闲, 自动 prompt "继续"
+// 零点击自动恢复: 深链参数优先; 无参数时自动打开最近的非空白会话;
+// 当前会话最后一轮含打断标记(TOOL_OUTCOME_UNKNOWN/TOOL_NOT_STARTED)时自动"继续"
 const wanted = new URLSearchParams(globalThis.location.search).get('session')
-if (wanted !== null) {
-  ctx.effect(() => {
-    const id = wanted as SessionId
-    let prompted = false
-    let unsubscribeSession: (() => void) | undefined
-    const openWhenReady = (): void => {
-      const state = ctx.sessions.list.getSnapshot()
-      if (state.current === undefined && state.byId[id] !== undefined) {
-        ctx.sessions.open(id)
-        globalThis.history?.replaceState(null, '', globalThis.location.pathname + globalThis.location.hash)
-      }
+ctx.effect(() => {
+  let prompted = false
+  let unsubscribeSession: (() => void) | undefined
+  const targetId = (): SessionId | undefined => {
+    if (wanted !== null) return wanted as SessionId
+    const state = ctx.sessions.list.getSnapshot()
+    let latest: SessionId | undefined
+    let latestTime = -1
+    for (const raw of Object.keys(state.byId)) {
+      const id = raw as SessionId
+      const summary = state.byId[id]
+      if (summary === undefined || summary.blank) continue
+      if (summary.updatedAt > latestTime) { latestTime = summary.updatedAt; latest = id }
     }
-    const continueIfInterrupted = (): void => {
-      if (prompted) return
-      const binding = ctx.sessions.binding(id)
-      if (binding === undefined) return
-      const snapshot = binding.session.getSnapshot()
-      if (snapshot.openState !== 'open' || snapshot.running) return
-      // 只检查最后一个用户消息之后的节点(最近一轮): 被打断轮次的合成闭合
-      // 特征出现在最近一轮才自动"继续"; 旧轮次的残留标记不会反复触发
-      let lastUserIndex = -1
-      for (let i = 0; i < snapshot.nodes.length; i++) {
-        if (snapshot.nodes[i].kind === 'user') lastUserIndex = i
-      }
-      const tail = lastUserIndex === -1 ? snapshot.nodes : snapshot.nodes.slice(lastUserIndex)
-      const interrupted = tail.some((node) =>
-        node.kind === 'tool-result' && node.isError
-        && (node.error?.code === 'TOOL_OUTCOME_UNKNOWN' || node.error?.code === 'TOOL_NOT_STARTED'))
-      if (!interrupted) return
-      prompted = true
-      void binding.session.prompt([{ type: 'text', text: '继续' }], 'queue')
+    return latest
+  }
+  const openWhenReady = (): void => {
+    const state = ctx.sessions.list.getSnapshot()
+    if (state.current !== undefined) return
+    const id = targetId()
+    if (id === undefined || state.byId[id] === undefined) return
+    ctx.sessions.open(id)
+    if (wanted !== null) {
+      globalThis.history?.replaceState(null, '', globalThis.location.pathname + globalThis.location.hash)
     }
-    const attachSession = (): void => {
-      if (unsubscribeSession !== undefined) return
-      const binding = ctx.sessions.binding(id)
-      if (binding === undefined) return
-      unsubscribeSession = binding.session.subscribe(continueIfInterrupted)
-      continueIfInterrupted()
+  }
+  const continueIfInterrupted = (): void => {
+    if (prompted) return
+    const current = ctx.sessions.list.getSnapshot().current
+    if (current === undefined) return
+    const binding = ctx.sessions.binding(current)
+    if (binding === undefined) return
+    const snapshot = binding.session.getSnapshot()
+    if (snapshot.openState !== 'open' || snapshot.running) return
+    // 只检查最后一个用户消息之后的节点(最近一轮)
+    let lastUserIndex = -1
+    for (let i = 0; i < snapshot.nodes.length; i++) {
+      if (snapshot.nodes[i].kind === 'user') lastUserIndex = i
     }
+    const tail = lastUserIndex === -1 ? snapshot.nodes : snapshot.nodes.slice(lastUserIndex)
+    const interrupted = tail.some((node) =>
+      node.kind === 'tool-result' && node.isError
+      && (node.error?.code === 'TOOL_OUTCOME_UNKNOWN' || node.error?.code === 'TOOL_NOT_STARTED'))
+    if (!interrupted) return
+    prompted = true
+    void binding.session.prompt([{ type: 'text', text: '继续' }], 'queue')
+  }
+  const attachSession = (): void => {
+    if (unsubscribeSession !== undefined) return
+    const current = ctx.sessions.list.getSnapshot().current
+    if (current === undefined) return
+    const binding = ctx.sessions.binding(current)
+    if (binding === undefined) return
+    unsubscribeSession = binding.session.subscribe(continueIfInterrupted)
+    continueIfInterrupted()
+  }
+  openWhenReady()
+  attachSession()
+  const unsubscribeList = ctx.sessions.list.subscribe(() => {
     openWhenReady()
     attachSession()
-    const unsubscribeList = ctx.sessions.list.subscribe(() => {
-      openWhenReady()
-      attachSession()
-    })
-    return () => {
-      unsubscribeList()
-      unsubscribeSession?.()
-    }
-  }, 'web: session deep link')
-}
+  })
+  return () => {
+    unsubscribeList()
+    unsubscribeSession?.()
+  }
+}, 'web: session auto-resume')
 ```
 
 （还需在文件顶部加 `import type { SessionId } from '@deepseek-ai/dsh-client-runtime/client'`。）
